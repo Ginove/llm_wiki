@@ -2,8 +2,11 @@ import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
 
 const HIDDEN_SOURCE_ENTRY_NAMES = new Set([".cache", ".DS_Store"])
-const SENSITIVE_CONFIG_EXTENSIONS = new Set(["env", "json", "toml", "yaml", "yml", "xml"])
-const SENSITIVE_CONFIG_DIR_NAMES = new Set([
+/** Exported so `importSourceFolder` can pass them to the Rust-side
+ *  `import_source_folder` command, keeping the sensitive-config rule single-
+ *  sourced here (mirrored by `is_sensitive_config_source_file` in fs.rs). */
+export const SENSITIVE_CONFIG_EXTENSIONS = new Set(["env", "json", "toml", "yaml", "yml", "xml"])
+export const SENSITIVE_CONFIG_DIR_NAMES = new Set([
   ".claude",
   ".codex",
   ".cursor",

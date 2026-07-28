@@ -8,6 +8,9 @@ const mocks = vi.hoisted(() => ({
   getFileSize: vi.fn(),
   listDirectory: vi.fn(),
   preprocessFile: vi.fn(),
+  // The Rust-side `import_source_folder` invoke wrapper (exported from
+  // @/commands/fs as `importSourceFolder`, aliased in source-lifecycle.ts).
+  importSourceFolderCommand: vi.fn(),
   enqueueBatch: vi.fn(),
 }))
 
@@ -22,6 +25,9 @@ vi.mock("@/commands/fs", async () => {
     getFileSize: mocks.getFileSize,
     listDirectory: mocks.listDirectory,
     preprocessFile: mocks.preprocessFile,
+    // Override the export named `importSourceFolder` (the invoke wrapper);
+    // source-lifecycle.ts imports it as `importSourceFolderCommand`.
+    importSourceFolder: mocks.importSourceFolderCommand,
   }
 })
 
@@ -46,6 +52,7 @@ beforeEach(() => {
   mocks.getFileSize.mockResolvedValue(1024)
   mocks.listDirectory.mockResolvedValue([])
   mocks.preprocessFile.mockResolvedValue("")
+  mocks.importSourceFolderCommand.mockResolvedValue({ copied: [], failed: [] })
   mocks.enqueueBatch.mockResolvedValue(["task"])
 })
 
@@ -66,21 +73,13 @@ describe("source-lifecycle path helpers", () => {
     ).toBe("reports > 2026")
   })
 
-  it("applies source watch exclusions during folder import before preprocess and ingest", async () => {
-    mocks.listDirectory.mockResolvedValue([
-      { name: "keep.md", path: "/external/imported/keep.md", is_dir: false },
-      { name: "config.json", path: "/external/imported/config.json", is_dir: false },
-      {
-        name: "drafts",
-        path: "/external/imported/drafts",
-        is_dir: true,
-        children: [
-          { name: "skip.md", path: "/external/imported/drafts/skip.md", is_dir: false },
-        ],
-      },
-    ])
+  it("forwards the watch config and copied files to the Rust import command", async () => {
+    mocks.importSourceFolderCommand.mockResolvedValue({
+      copied: ["/project/raw/sources/imported/keep.md"],
+      failed: [],
+    })
 
-    const copied = await importSourceFolder(
+    const result = await importSourceFolder(
       { id: "p1", name: "Project", path: "/project" },
       "/external/imported",
       {
@@ -102,11 +101,27 @@ describe("source-lifecycle path helpers", () => {
       },
     )
 
-    expect(copied).toEqual(["/project/raw/sources/imported/keep.md"])
-    expect(mocks.copyFile).toHaveBeenCalledTimes(1)
-    expect(mocks.copyFile).toHaveBeenCalledWith("/external/imported/keep.md", "/project/raw/sources/imported/keep.md")
-    expect(mocks.copyFile).not.toHaveBeenCalledWith("/external/imported/config.json", expect.anything())
-    expect(mocks.copyFile).not.toHaveBeenCalledWith("/external/imported/drafts/skip.md", expect.anything())
+    expect(result.importedPaths).toEqual(["/project/raw/sources/imported/keep.md"])
+    expect(result.failures).toEqual([])
+    // The filtering now happens on the Rust side; the TS layer must forward
+    // the normalized watch config (and the sensitive-config rule source) so
+    // `import_source_folder` can mirror isSensitiveConfigSourceFile /
+    // isPathAllowedBySourceWatch.
+    expect(mocks.importSourceFolderCommand).toHaveBeenCalledWith(
+      "/external/imported",
+      "/project/raw/sources/imported",
+      "imported",
+      expect.objectContaining({
+        includeHidden: true,
+        maxBytes: 100 * 1024 * 1024,
+        includeExtensions: ["md"],
+        excludeExtensions: ["json"],
+        excludeDirs: ["drafts"],
+        excludeGlobs: [],
+        sensitiveConfigDirs: expect.arrayContaining([".claude", ".codex", ".cursor", ".gemini", ".mcp"]),
+        sensitiveConfigExtensions: expect.arrayContaining(["env", "json", "toml", "yaml", "yml", "xml"]),
+      }),
+    )
     expect(mocks.deleteFile).not.toHaveBeenCalled()
     expect(mocks.preprocessFile).toHaveBeenCalledOnce()
     expect(mocks.preprocessFile).toHaveBeenCalledWith("/project/raw/sources/imported/keep.md")
@@ -118,28 +133,16 @@ describe("source-lifecycle path helpers", () => {
     ])
   })
 
-  it("does not import config-like files from hidden tool folders", async () => {
-    mocks.listDirectory.mockResolvedValue([
-      {
-        name: ".claude",
-        path: "/external/imported/.claude",
-        is_dir: true,
-        children: [
-          { name: "settings.json", path: "/external/imported/.claude/settings.json", is_dir: false },
-          { name: "research.md", path: "/external/imported/.claude/research.md", is_dir: false },
-        ],
-      },
-      {
-        name: ".codex",
-        path: "/external/imported/.codex",
-        is_dir: true,
-        children: [
-          { name: "config.yaml", path: "/external/imported/.codex/config.yaml", is_dir: false },
-        ],
-      },
-    ])
+  it("surfaces per-file copy failures returned by the Rust command without aborting ingest", async () => {
+    mocks.importSourceFolderCommand.mockResolvedValue({
+      copied: ["/project/raw/sources/imported/.claude/research.md"],
+      failed: [
+        { path: "/external/imported/.claude/settings.json", reason: "excluded" },
+        { path: "/external/imported/.codex/config.yaml", reason: "excluded" },
+      ],
+    })
 
-    const copied = await importSourceFolder(
+    const result = await importSourceFolder(
       { id: "p1", name: "Project", path: "/project" },
       "/external/imported",
       {
@@ -161,14 +164,17 @@ describe("source-lifecycle path helpers", () => {
       },
     )
 
-    expect(copied).toEqual(["/project/raw/sources/imported/.claude/research.md"])
-    expect(mocks.copyFile).toHaveBeenCalledTimes(1)
-    expect(mocks.copyFile).toHaveBeenCalledWith(
-      "/external/imported/.claude/research.md",
-      "/project/raw/sources/imported/.claude/research.md",
-    )
-    expect(mocks.copyFile).not.toHaveBeenCalledWith("/external/imported/.claude/settings.json", expect.anything())
-    expect(mocks.copyFile).not.toHaveBeenCalledWith("/external/imported/.codex/config.yaml", expect.anything())
+    expect(result.importedPaths).toEqual(["/project/raw/sources/imported/.claude/research.md"])
+    expect(result.failures).toHaveLength(2)
+    expect(result.failures[0].path).toBe("/external/imported/.claude/settings.json")
+    // A failure must not abort ingest of the files that did copy.
+    expect(mocks.enqueueBatch).toHaveBeenCalledTimes(1)
+    expect(mocks.enqueueBatch).toHaveBeenCalledWith("p1", [
+      {
+        sourcePath: "/project/raw/sources/imported/.claude/research.md",
+        folderContext: "imported > .claude",
+      },
+    ])
   })
 
   it("rejects importing the project folder or folders inside it", async () => {
@@ -202,7 +208,7 @@ describe("source-lifecycle path helpers", () => {
       ),
     ).rejects.toThrow("Cannot import the project folder")
 
-    expect(mocks.listDirectory).not.toHaveBeenCalled()
+    expect(mocks.importSourceFolderCommand).not.toHaveBeenCalled()
     expect(mocks.copyFile).not.toHaveBeenCalled()
   })
 
@@ -299,13 +305,16 @@ describe("source-lifecycle path helpers", () => {
   })
 
   it("naturally orders imported folder files before enqueueing ingest tasks", async () => {
-    mocks.listDirectory.mockResolvedValue([
-      { name: "10.md", path: "/external/imported/10.md", is_dir: false },
-      { name: "2.md", path: "/external/imported/2.md", is_dir: false },
-      { name: "1.md", path: "/external/imported/1.md", is_dir: false },
-    ])
+    mocks.importSourceFolderCommand.mockResolvedValue({
+      copied: [
+        "/project/raw/sources/imported/10.md",
+        "/project/raw/sources/imported/2.md",
+        "/project/raw/sources/imported/1.md",
+      ],
+      failed: [],
+    })
 
-    const copied = await importSourceFolder(
+    const result = await importSourceFolder(
       { id: "p1", name: "Project", path: "/project" },
       "/external/imported",
       {
@@ -327,7 +336,7 @@ describe("source-lifecycle path helpers", () => {
       },
     )
 
-    expect(copied).toEqual([
+    expect(result.importedPaths).toEqual([
       "/project/raw/sources/imported/1.md",
       "/project/raw/sources/imported/2.md",
       "/project/raw/sources/imported/10.md",

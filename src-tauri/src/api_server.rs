@@ -972,11 +972,14 @@ fn push_file_node(
     count: &mut usize,
     out: &mut Vec<ApiFileNode>,
 ) -> Result<(), String> {
+    // Use `to_string_lossy` (not `to_str()`) so non-UTF-8 filenames (typical
+    // GBK names from a Windows zh-CN system) are not reduced to an empty
+    // name here — consistent with `build_tree` in fs.rs. Mirrors the fix
+    // that lets folder import handle Chinese paths on Linux.
     let name = path
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     if name.starts_with('.') {
         return Ok(());
     }

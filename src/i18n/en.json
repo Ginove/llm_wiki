@@ -184,6 +184,8 @@
     "refreshFolderHint": "Rescan the source folder and process new, changed, or deleted files.",
     "refreshFolderTooltip": "Rescan the project source folder with the same rules as automatic monitoring. New or modified allowed files are queued for ingest; deleted sources trigger the normal wiki and index cleanup; then the file tree is rebuilt.",
     "refreshFailed": "Failed to refresh sources: {{error}}",
+    "importFolderPartialFailed": "Imported {{success}} file(s); {{failed}} failed: {{files}}",
+    "importFolderFailed": "Failed to import folder: {{error}}",
     "ingest": "Ingest",
     "delete": "Delete source and related wiki pages",
     "deleteConfirm": "Delete \"{{name}}\" and its related wiki pages?\n\nThis will:\n- Delete the source file\n- Delete wiki pages generated from this source\n- Update index.md",

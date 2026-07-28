@@ -8,7 +8,7 @@ import { useWikiStore } from "@/stores/wiki-store"
 import { listDirectory, readFile } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { useTranslation } from "react-i18next"
-import { normalizePath } from "@/lib/path-utils"
+import { getFileName, normalizePath } from "@/lib/path-utils"
 import { decideDeleteClick } from "@/lib/sources-tree-delete"
 import { rescanProjectFileSync } from "@/lib/project-file-sync"
 import { naturalCompare } from "@/lib/natural-sort"
@@ -41,6 +41,7 @@ export function SourcesView() {
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [importError, setImportError] = useState<string | null>(null)
   const [urlDialogOpen, setUrlDialogOpen] = useState(false)
   const [urlInput, setUrlInput] = useState("")
   const [urlError, setUrlError] = useState<string | null>(null)
@@ -162,11 +163,32 @@ export function SourcesView() {
     if (!selected || typeof selected !== "string") return
 
     setImporting(true)
+    setImportError(null)
     try {
-      await importSourceFolder(project, selected, llmConfig, sourceWatchConfig)
+      const result = await importSourceFolder(project, selected, llmConfig, sourceWatchConfig)
+      if (result.failures.length > 0) {
+        const preview = result.failures
+          .slice(0, 10)
+          .map((f) => getFileName(f.path))
+          .join(", ")
+        setImportError(
+          t("sources.importFolderPartialFailed", {
+            defaultValue: "Imported {{success}} file(s); {{failed}} failed: {{files}}",
+            success: result.importedPaths.length,
+            failed: result.failures.length,
+            files: preview,
+          }),
+        )
+      }
       await loadSources()
     } catch (err) {
       console.error(`Failed to import folder:`, err)
+      setImportError(
+        t("sources.importFolderFailed", {
+          defaultValue: "Failed to import folder: {{error}}",
+          error: String(err),
+        }),
+      )
     } finally {
       setImporting(false)
     }
@@ -372,6 +394,11 @@ export function SourcesView() {
               defaultValue: "Failed to refresh sources: {{error}}",
               error: refreshError,
             })}
+          </div>
+        )}
+        {importError && (
+          <div className="mx-4 mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {importError}
           </div>
         )}
         {sources.length === 0 ? (

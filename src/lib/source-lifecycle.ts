@@ -1,6 +1,5 @@
 import {
   copyFile,
-  createDirectory,
   deleteFile,
   fileExists,
   getFileSize,
@@ -8,7 +7,9 @@ import {
   preprocessFile,
   readFile,
   writeFile,
+  importSourceFolder as importSourceFolderCommand,
 } from "@/commands/fs"
+import type { ImportFilterConfig, ImportFailure } from "@/commands/fs"
 import type { WikiProject, FileNode } from "@/types/wiki"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { enqueueBatch } from "@/lib/ingest-queue"
@@ -36,7 +37,11 @@ import {
 } from "@/lib/wiki-cleanup"
 import { collectAllFilesIncludingDot } from "@/lib/sources-tree-delete"
 import { isPathAllowedBySourceWatch, normalizeSourceWatchConfig } from "@/lib/source-watch-config"
-import { isSensitiveConfigSourceFile } from "@/lib/source-filter"
+import {
+  isSensitiveConfigSourceFile,
+  SENSITIVE_CONFIG_DIR_NAMES,
+  SENSITIVE_CONFIG_EXTENSIONS,
+} from "@/lib/source-filter"
 import { naturalCompare } from "@/lib/natural-sort"
 import type { SourceWatchConfig } from "@/stores/wiki-store"
 
@@ -76,12 +81,6 @@ function flattenFiles(nodes: FileNode[]): FileNode[] {
     }
   }
   return files
-}
-
-function parentPath(path: string): string {
-  const normalized = normalizePath(path)
-  const index = normalized.lastIndexOf("/")
-  return index > 0 ? normalized.slice(0, index) : ""
 }
 
 function stripTrailingSlash(path: string): string {
@@ -306,12 +305,17 @@ export async function importSourceFiles(
   return importedPaths
 }
 
+export interface ImportSourceFolderResult {
+  importedPaths: string[]
+  failures: ImportFailure[]
+}
+
 export async function importSourceFolder(
   project: WikiProject,
   selectedFolder: string,
   llmConfig: LlmConfig,
   sourceWatchConfig?: SourceWatchConfig,
-): Promise<string[]> {
+): Promise<ImportSourceFolderResult> {
   const pp = normalizePath(project.path)
   const sourceRoot = normalizePath(selectedFolder)
   if (isProjectScopedImport(pp, sourceRoot)) {
@@ -321,37 +325,37 @@ export async function importSourceFolder(
   const destDir = `${pp}/raw/sources/${folderName}`
   const cfg = normalizeSourceWatchConfig(sourceWatchConfig)
   const maxBytes = cfg.maxFileSizeMb * 1024 * 1024
-  const allowedFiles: string[] = []
-  // include hidden: a user importing a folder into raw/sources may
-  // legitimately want dotfolder notes. Config-like files under known
-  // agent/tool config folders are still filtered before copy so API
-  // keys / tool config do not enter ingest.
-  const sourceFiles = flattenFiles(await listDirectory(selectedFolder, true))
 
-  for (const file of sourceFiles) {
-    const relativeSourcePath = getRelativePath(file.path, sourceRoot)
-    const destPath = `${destDir}/${relativeSourcePath}`
-    const relPath = `raw/sources/${folderName}/${relativeSourcePath}`
-    if (isSensitiveConfigSourceFile(file.path)) {
-      continue
-    }
-    let allowed = isPathAllowedBySourceWatch(relPath, cfg)
-    if (allowed) {
-      try {
-        allowed = await getFileSize(file.path) <= maxBytes
-      } catch {
-        allowed = false
-      }
-    }
-    if (!allowed) continue
-    const parent = parentPath(destPath)
-    if (parent) await createDirectory(parent)
-    await copyFile(file.path, destPath)
-    allowedFiles.push(destPath)
+  // Drive the copy on the Rust side with raw OsStr bytes so non-UTF-8
+  // filenames (typical GBK names copied from a Windows zh-CN system, the
+  // common cause of "importing a folder with Chinese paths fails on
+  // Ubuntu") are neither silently dropped nor path-corrupted to U+FFFD.
+  // The Rust command also collects per-file copy errors instead of
+  // aborting the whole import. Filtering mirrors the old per-file logic
+  // (isSensitiveConfigSourceFile + isPathAllowedBySourceWatch) on the
+  // Rust side — see `import_source_folder` / `is_sensitive_config_source_file`
+  // / `is_path_allowed_by_source_watch` in fs.rs. includeHidden stays true
+  // (matches the prior listDirectory(true) call): a user importing a
+  // folder may legitimately want dotfolder notes; config-like files under
+  // known agent/tool config folders are still filtered before copy.
+  const config: ImportFilterConfig = {
+    includeHidden: true,
+    maxBytes,
+    includeExtensions: cfg.includeExtensions,
+    excludeExtensions: cfg.excludeExtensions,
+    excludeDirs: cfg.excludeDirs,
+    excludeGlobs: cfg.excludeGlobs,
+    sensitiveConfigDirs: [...SENSITIVE_CONFIG_DIR_NAMES],
+    sensitiveConfigExtensions: [...SENSITIVE_CONFIG_EXTENSIONS],
+  }
+  const { copied, failed } = await importSourceFolderCommand(sourceRoot, destDir, folderName, config)
+
+  // Best-effort pre-extraction (matches the prior per-file behavior).
+  for (const destPath of copied) {
     preprocessFile(destPath).catch(() => {})
   }
 
-  const naturallyOrderedFiles = [...allowedFiles].sort((a, b) =>
+  const naturallyOrderedFiles = [...copied].sort((a, b) =>
     naturalCompare(getRelativePath(a, destDir), getRelativePath(b, destDir)),
   )
 
@@ -362,7 +366,7 @@ export async function importSourceFolder(
     })
   }
 
-  return naturallyOrderedFiles
+  return { importedPaths: naturallyOrderedFiles, failures: failed }
 }
 
 export async function deleteSourceFile(

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use calamine::{open_workbook_auto, Data, Reader};
 use office_oxide::Document;
+use serde::{Deserialize, Serialize};
 
 use crate::commands::file_sync;
 use crate::panic_guard::run_guarded;
@@ -1478,11 +1479,17 @@ fn build_tree(
         .map_err(|e| format!("Failed to read directory '{}': {}", dir.display(), e))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .map(|n| entry_is_visible(n, include_hidden))
-                .unwrap_or(false)
+            // Use `to_string_lossy` so non-UTF-8 filenames (typical GBK
+            // names copied from a Windows zh-CN system, common on Linux)
+            // are not silently dropped when `to_str()` returns None. The
+            // underlying byte path is untouched; only the string used for
+            // visibility/display is lossy-converted (and the actual copy
+            // for folder import happens in `import_source_folder`, which
+            // keeps raw OsStr bytes end-to-end). `into_owned()` keeps this
+            // correct whether `file_name()` returns an owned OsString or a
+            // borrowed &OsStr.
+            let name = entry.file_name().to_string_lossy().into_owned();
+            entry_is_visible(&name, include_hidden)
         })
         .collect();
 
@@ -1500,7 +1507,7 @@ fn build_tree(
     let mut nodes = Vec::new();
     for entry in entries {
         let entry_path = entry.path();
-        let name = entry.file_name().to_str().unwrap_or("").to_string();
+        let name = entry.file_name().to_string_lossy().into_owned();
         // Always return forward-slash paths so the TS layer can compare
         // and compose paths consistently across Windows and Unix. Windows
         // APIs accept forward slashes, so normalizing here is safe and
@@ -1606,6 +1613,290 @@ pub async fn copy_directory(source: String, destination: String) -> Result<Vec<S
     })
     .await
     .map_err(|e| format!("copy_directory blocking task join error: {e}"))?
+}
+
+// ---------------------------------------------------------------------------
+// import_source_folder
+//
+// Import a user-selected folder into `raw/sources/<folder_name>`. The whole
+// traverse + filter + copy runs on the Rust side with raw `OsStr` bytes, so
+// non-UTF-8 filenames (typical GBK names copied from a Windows zh-CN system,
+// which is the common cause of "importing a folder with Chinese paths fails
+// on Ubuntu") are neither silently dropped nor path-corrupted.
+//
+// Previously the TS `importSourceFolder` drove the copy via `list_directory`
+// (whose `build_tree` round-trips every name through a UTF-8 `String`) +
+// `copy_file`, so a GBK filename either vanished from the tree or came back
+// as a U+FFFD-corrupted path that `fs::copy` could not open.
+//
+// The filtering below mirrors the TS logic in
+//   src/lib/source-filter.ts        (isSensitiveConfigSourceFile)
+//   src/lib/source-watch-config.ts  (isPathAllowedBySourceWatch)
+// Keep them in sync: a rule change on one side must be reflected on the other.
+// Per-file copy errors are collected instead of aborting the whole import.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct ImportFailure {
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Serialize)]
+pub struct ImportFolderResult {
+    pub copied: Vec<String>,
+    pub failed: Vec<ImportFailure>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportFilterConfig {
+    pub include_hidden: bool,
+    pub max_bytes: u64,
+    /// Already lower-cased, leading dots stripped (see TS `normalizeExtensions`).
+    pub include_extensions: Vec<String>,
+    pub exclude_extensions: Vec<String>,
+    pub exclude_dirs: Vec<String>,
+    pub exclude_globs: Vec<String>,
+    pub sensitive_config_dirs: Vec<String>,
+    pub sensitive_config_extensions: Vec<String>,
+}
+
+fn normalize_slashes(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn get_extension(name: &str) -> String {
+    // Mirror of `getSourceWatchExtension` (source-watch-config.ts): if the
+    // name has no '.', return ""; otherwise the lower-cased segment after
+    // the last '.'. ".env" -> "env", "archive.tar.gz" -> "gz".
+    if !name.contains('.') {
+        return String::new();
+    }
+    match name.rsplit_once('.') {
+        Some((_, ext)) => ext.to_ascii_lowercase(),
+        None => String::new(),
+    }
+}
+
+/// Wildcard match (`*` -> any sequence, `?` -> single char),
+/// case-insensitive, whole-string. Equivalent to the TS
+/// `wildcardToRegExp`/`matchesGlob` pipeline: the regex meta-characters
+/// there are escaped, so effectively only `*` and `?` are special.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (m, n) = (p.len(), t.len());
+    // dp[i][j] = pattern[..i] matches text[..j]
+    let mut dp = vec![vec![false; n + 1]; m + 1];
+    dp[0][0] = true;
+    for i in 1..=m {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            match p[i - 1] {
+                '*' => dp[i][j] = dp[i - 1][j] || dp[i][j - 1],
+                '?' => dp[i][j] = dp[i - 1][j - 1],
+                c => dp[i][j] = dp[i - 1][j - 1] && c.eq_ignore_ascii_case(&t[j - 1]),
+            }
+        }
+    }
+    dp[m][n]
+}
+
+/// Mirror of `matchesGlob` (source-watch-config.ts): match against the
+/// entry name or the full normalized path.
+fn matches_glob(path: &str, pattern: &str) -> bool {
+    let normalized = normalize_slashes(path);
+    let name = normalized.split('/').last().unwrap_or(normalized.as_str());
+    glob_match(pattern, name) || glob_match(pattern, normalized.as_str())
+}
+
+/// Mirror of `pathMatchesExcludedDir` (source-watch-config.ts).
+fn path_matches_excluded_dir(path: &str, excluded_dir: &str) -> bool {
+    let normalized = normalize_slashes(path).to_ascii_lowercase();
+    let dir = normalize_slashes(excluded_dir).to_ascii_lowercase();
+    if dir.is_empty() {
+        return false;
+    }
+    if dir.contains('/') {
+        return normalized == dir
+            || normalized.contains(&format!("/{}/", dir))
+            || normalized.starts_with(&format!("{}/", dir));
+    }
+    normalized.split('/').any(|part| part == dir)
+}
+
+/// Mirror of `isSensitiveConfigSourceFile` (src/lib/source-filter.ts).
+fn is_sensitive_config_source_file(path: &str, config: &ImportFilterConfig) -> bool {
+    let normalized = normalize_slashes(path);
+    let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    let name = parts.last().copied().unwrap_or("");
+    let ext = get_extension(name);
+    !ext.is_empty()
+        && config
+            .sensitive_config_extensions
+            .iter()
+            .any(|e| e == &ext)
+        && parts.iter().any(|part| {
+            config
+                .sensitive_config_dirs
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(part))
+        })
+}
+
+/// Mirror of `isPathAllowedBySourceWatch` (src/lib/source-watch-config.ts).
+fn is_path_allowed_by_source_watch(path: &str, config: &ImportFilterConfig) -> bool {
+    let normalized = normalize_slashes(path);
+    let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+
+    for dir in &config.exclude_dirs {
+        if path_matches_excluded_dir(&normalized, dir) {
+            return false;
+        }
+    }
+    for pattern in &config.exclude_globs {
+        if matches_glob(&normalized, pattern) {
+            return false;
+        }
+    }
+    let name = parts.last().copied().unwrap_or("");
+    if name.is_empty() || name.starts_with('.') {
+        return false;
+    }
+    let ext = get_extension(name);
+    if !ext.is_empty() && config.exclude_extensions.iter().any(|e| e == &ext) {
+        return false;
+    }
+    if !config.include_extensions.is_empty()
+        && (ext.is_empty() || !config.include_extensions.iter().any(|e| e == &ext))
+    {
+        return false;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_recursive(
+    src: &Path,
+    src_root: &Path,
+    dest: &Path,
+    folder_name: &str,
+    config: &ImportFilterConfig,
+    copied: &mut Vec<String>,
+    failed: &mut Vec<ImportFailure>,
+) -> Result<(), String> {
+    fs::create_dir_all(dest)
+        .map_err(|e| format!("Failed to create dir '{}': {}", dest.display(), e))?;
+    let entries = fs::read_dir(src)
+        .map_err(|e| format!("Failed to read dir '{}': {}", src.display(), e))?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                failed.push(ImportFailure {
+                    path: src.to_string_lossy().replace('\\', "/"),
+                    reason: format!("Dir entry error: {}", e),
+                });
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name_os = entry.file_name();
+        let dest_path = dest.join(&name_os);
+        let name = name_os.to_string_lossy().into_owned();
+        // Hidden filter (matches `entry_is_visible` semantics).
+        if !config.include_hidden && name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            import_recursive(&path, src_root, &dest_path, folder_name, config, copied, failed)?;
+        } else {
+            let src_lossy = path.to_string_lossy().replace('\\', "/");
+            if is_sensitive_config_source_file(&src_lossy, config) {
+                continue;
+            }
+            // `rel` is relative to the source root (lossy for non-UTF-8 names;
+            // used only for filtering, not for the copy itself).
+            let rel = path
+                .strip_prefix(src_root)
+                .unwrap_or(path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let rel_path_for_filter = format!("raw/sources/{}/{}", folder_name, rel);
+            if !is_path_allowed_by_source_watch(&rel_path_for_filter, config) {
+                continue;
+            }
+            // Size check.
+            match fs::metadata(&path) {
+                Ok(meta) => {
+                    if meta.len() > config.max_bytes {
+                        failed.push(ImportFailure {
+                            path: src_lossy,
+                            reason: format!(
+                                "exceeds size limit ({} > {} bytes)",
+                                meta.len(),
+                                config.max_bytes
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    failed.push(ImportFailure {
+                        path: src_lossy,
+                        reason: format!("Failed to read metadata: {}", e),
+                    });
+                    continue;
+                }
+            }
+            // Copy with per-file tolerance: a single failure must not abort
+            // the whole import (the old `importSourceFolder` had no try/catch
+            // around `copyFile`, so one bad file rejected the entire folder).
+            if let Err(e) = fs::copy(&path, &dest_path) {
+                failed.push(ImportFailure {
+                    path: src_lossy,
+                    reason: format!("Failed to copy: {}", e),
+                });
+                continue;
+            }
+            file_sync::mark_app_write_path(&dest_path);
+            copied.push(dest_path.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn import_source_folder(
+    source: String,
+    destination: String,
+    folder_name: String,
+    config: ImportFilterConfig,
+) -> Result<ImportFolderResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_guarded("import_source_folder", || {
+            let src = Path::new(&source);
+            let dest = Path::new(&destination);
+            file_sync::mark_app_write_path(dest);
+            if !src.exists() {
+                return Err(format!("Source does not exist: '{}'", source));
+            }
+            if !src.is_dir() {
+                return Err(format!("Source is not a directory: '{}'", source));
+            }
+            let mut copied = Vec::new();
+            let mut failed = Vec::new();
+            import_recursive(src, src, dest, &folder_name, &config, &mut copied, &mut failed)?;
+            Ok(ImportFolderResult { copied, failed })
+        })
+    })
+    .await
+    .map_err(|e| format!("import_source_folder blocking task join error: {e}"))?
 }
 
 #[tauri::command]

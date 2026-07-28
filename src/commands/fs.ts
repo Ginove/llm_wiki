@@ -105,6 +105,57 @@ export async function copyDirectory(
   return invoke<string[]>("copy_directory", { source, destination })
 }
 
+/** A file the Rust `import_source_folder` command could not copy. */
+export interface ImportFailure {
+  path: string
+  reason: string
+}
+
+/** Result of `import_source_folder` (Rust). `copied` holds the destination
+ *  paths that were actually written; `failed` holds per-file errors so the
+ *  UI can report them instead of a whole-folder rejection. */
+export interface ImportFolderResult {
+  copied: string[]
+  failed: ImportFailure[]
+}
+
+/** Filter config for `import_source_folder`. Mirrors the Rust struct
+ *  `ImportFilterConfig` (fs.rs) which is `#[serde(rename_all = "camelCase")]`,
+ *  so the keys here are camelCase. Values are the already-normalized outputs
+ *  of `normalizeSourceWatchConfig` (lower-cased, dot-stripped extensions). */
+export interface ImportFilterConfig {
+  includeHidden: boolean
+  maxBytes: number
+  includeExtensions: string[]
+  excludeExtensions: string[]
+  excludeDirs: string[]
+  excludeGlobs: string[]
+  sensitiveConfigDirs: string[]
+  sensitiveConfigExtensions: string[]
+}
+
+/**
+ * Import a source folder by traversing + filtering + copying on the Rust
+ * side with raw `OsStr` bytes. This avoids the Linux failure where a non-
+ * UTF-8 (typical GBK) filename was silently dropped by `list_directory` /
+ * `build_tree` or path-corrupted to U+FFFD, and collects per-file copy
+ * errors instead of aborting the whole import. The orchestrator in
+ * `source-lifecycle.ts` (re)uses this as the copy step.
+ */
+export async function importSourceFolder(
+  source: string,
+  destination: string,
+  folderName: string,
+  config: ImportFilterConfig,
+): Promise<ImportFolderResult> {
+  return invoke<ImportFolderResult>("import_source_folder", {
+    source,
+    destination,
+    folderName,
+    config,
+  })
+}
+
 export async function preprocessFile(path: string): Promise<string> {
   return invoke<string>("preprocess_file", { path })
 }
