@@ -312,6 +312,20 @@ interface MultimodalConfig {
 }
 
 /**
+ * Ingest pipeline settings.
+ *
+ * `concurrency` controls how many documents are processed simultaneously
+ * by the ingest queue. Each concurrent ingest runs its LLM compute phase
+ * (analysis, generation, captions) in parallel; file writes are
+ * serialized per-page via `page-write-lock` and aggregate commits
+ * (index.md, log.md, cache) via `commit-lock`.
+ */
+export interface IngestConfig {
+  /** Max concurrent ingest tasks. 1 = serial (legacy behavior). */
+  concurrency: number
+}
+
+/**
  * Per-preset saved fields. Each entry survives turning the preset off
  * and coming back — users don't have to re-enter an API key when they
  * briefly switch to a different provider.
@@ -417,6 +431,7 @@ interface WikiState {
   searchApiConfig: SearchApiConfig
   embeddingConfig: EmbeddingConfig
   multimodalConfig: MultimodalConfig
+  ingestConfig: IngestConfig
   outputLanguage: OutputLanguage
   proxyConfig: ProxyConfig
   scheduledImportConfig: ScheduledImportConfig
@@ -448,6 +463,7 @@ interface WikiState {
   setSearchApiConfig: (config: SearchApiConfig) => void
   setEmbeddingConfig: (config: EmbeddingConfig) => void
   setMultimodalConfig: (config: MultimodalConfig) => void
+  setIngestConfig: (config: IngestConfig) => void
   setOutputLanguage: (lang: OutputLanguage) => void
   setProxyConfig: (config: ProxyConfig) => void
   setScheduledImportConfig: (config: ScheduledImportConfig) => void
@@ -595,6 +611,14 @@ export const useWikiStore = create<WikiState>((set) => ({
     concurrency: 4,
   },
 
+  ingestConfig: {
+    // Default 3 concurrent ingests. Each ingest's LLM compute phase
+    // (analysis, generation, captions) runs in parallel; file writes
+    // are serialized per-page and aggregate commits via brief locks.
+    // 1 = legacy serial behavior.
+    concurrency: 3,
+  },
+
   outputLanguage: "auto",
 
   proxyConfig: {
@@ -657,6 +681,7 @@ export const useWikiStore = create<WikiState>((set) => ({
   setSearchApiConfig: (searchApiConfig) => set({ searchApiConfig }),
   setEmbeddingConfig: (embeddingConfig) => set({ embeddingConfig }),
   setMultimodalConfig: (multimodalConfig) => set({ multimodalConfig }),
+  setIngestConfig: (ingestConfig) => set({ ingestConfig }),
   setOutputLanguage: (outputLanguage) => set({ outputLanguage }),
   setProxyConfig: (proxyConfig) => set({ proxyConfig }),
   setScheduledImportConfig: (scheduledImportConfig) => set({ scheduledImportConfig }),

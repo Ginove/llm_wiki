@@ -329,6 +329,32 @@ export function MultimodalSection({ draft, setDraft }: Props) {
           </div>
         </>
       )}
+
+      {/* Ingest queue concurrency — controls how many documents are
+          processed simultaneously by the ingest pipeline. Each
+          concurrent ingest spawns multiple LLM calls (analysis +
+          generation + optional captions), so even modest values
+          multiply the request rate to the LLM endpoint. */}
+      <div className="space-y-2 rounded-md border p-3">
+        <Label>{t("settings.sections.multimodal.ingestConcurrency", "Concurrent ingest tasks")}</Label>
+        <Input
+          type="number"
+          min={1}
+          max={10}
+          step={1}
+          value={draft.ingestConcurrency}
+          onChange={(e) => {
+            const n = Number(e.target.value)
+            setDraft("ingestConcurrency", Number.isFinite(n) ? n : 3)
+          }}
+        />
+        <p className="text-xs text-muted-foreground">
+          {t(
+            "settings.sections.multimodal.ingestConcurrencyHint",
+            "How many documents are processed simultaneously. Each ingest runs multiple LLM calls, so 3 concurrent ingests may mean 9+ parallel API requests. 1 = serial (legacy). 3 is a good default.",
+          )}
+        </p>
+      </div>
     </div>
   )
 }

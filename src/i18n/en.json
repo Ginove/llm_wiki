@@ -640,7 +640,9 @@
         "costPoint1": "Each new image triggers one vision-LLM call (~500-2000 tokens depending on model + thinking mode).",
         "costPoint2": "Captions are cached by SHA-256 of image bytes. Duplicate logos / shared chart templates across documents only ever incur ONE call.",
         "costPoint3": "Rust-side filter drops images smaller than 100×100 px and caps at 500 images per source — pathological PDFs can't blow up the bill.",
-        "costPoint4": "Prefer a local vision model (Qwen2.5-VL via LM Studio / Ollama) for bulk ingestion; reserve hosted vision APIs for one-off high-stakes documents."
+        "costPoint4": "Prefer a local vision model (Qwen2.5-VL via LM Studio / Ollama) for bulk ingestion; reserve hosted vision APIs for one-off high-stakes documents.",
+        "ingestConcurrency": "Concurrent ingest tasks",
+        "ingestConcurrencyHint": "How many documents are processed simultaneously. Each ingest runs multiple LLM calls, so 3 concurrent ingests may mean 9+ parallel API requests. 1 = serial (legacy). 3 is a good default."
       },
       "webSearch": {
         "title": "External Information Sources",

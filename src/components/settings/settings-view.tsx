@@ -93,6 +93,7 @@ function initialDraft(
   llm: ReturnType<typeof useWikiStore.getState>["llmConfig"],
   embed: ReturnType<typeof useWikiStore.getState>["embeddingConfig"],
   multimodal: ReturnType<typeof useWikiStore.getState>["multimodalConfig"],
+  ingest: ReturnType<typeof useWikiStore.getState>["ingestConfig"],
   outputLanguage: ReturnType<typeof useWikiStore.getState>["outputLanguage"],
   proxy: ReturnType<typeof useWikiStore.getState>["proxyConfig"],
   scheduledImport: ReturnType<typeof useWikiStore.getState>["scheduledImportConfig"],
@@ -150,6 +151,7 @@ function initialDraft(
     multimodalAzureModelFamily: multimodal.azureModelFamily ?? "auto",
     multimodalApiMode: multimodal.apiMode,
     multimodalConcurrency: multimodal.concurrency,
+    ingestConcurrency: ingest.concurrency,
     outputLanguage,
     maxHistoryMessages,
     proxyEnabled: proxy.enabled,
@@ -195,6 +197,8 @@ export function SettingsView() {
   const setEmbeddingConfig = useWikiStore((s) => s.setEmbeddingConfig)
   const multimodalConfig = useWikiStore((s) => s.multimodalConfig)
   const setMultimodalConfig = useWikiStore((s) => s.setMultimodalConfig)
+  const ingestConfig = useWikiStore((s) => s.ingestConfig)
+  const setIngestConfig = useWikiStore((s) => s.setIngestConfig)
   const outputLanguage = useWikiStore((s) => s.outputLanguage)
   const setOutputLanguage = useWikiStore((s) => s.setOutputLanguage)
   const proxyConfig = useWikiStore((s) => s.proxyConfig)
@@ -230,6 +234,7 @@ export function SettingsView() {
       llmConfig,
       embeddingConfig,
       multimodalConfig,
+      ingestConfig,
       outputLanguage,
       proxyConfig,
       scheduledImportConfig,
@@ -287,6 +292,7 @@ export function SettingsView() {
         llmConfig,
         embeddingConfig,
         multimodalConfig,
+        ingestConfig,
         outputLanguage,
         proxyConfig,
         scheduledImportConfig,
@@ -305,6 +311,7 @@ export function SettingsView() {
     llmConfig,
     embeddingConfig,
     multimodalConfig,
+    ingestConfig,
     outputLanguage,
     proxyConfig,
     scheduledImportConfig,
@@ -334,6 +341,8 @@ export function SettingsView() {
       loadEmbeddingConfig,
       saveMultimodalConfig,
       loadMultimodalConfig,
+      saveIngestConfig,
+      loadIngestConfig,
       saveOutputLanguage,
       loadOutputLanguage,
       saveProxyConfig,
@@ -395,6 +404,13 @@ export function SettingsView() {
       // slot.
       concurrency: Math.max(1, Math.min(16, draft.multimodalConcurrency || 4)),
     }
+    const newIngest = {
+      // Clamp at save time. Each concurrent ingest spawns multiple LLM
+      // calls (analysis + generation + optional captions), so even 10
+      // concurrent ingests can mean 30+ parallel HTTP requests to the
+      // LLM endpoint. Going higher risks provider rate-limiting.
+      concurrency: Math.max(1, Math.min(10, Math.floor(draft.ingestConcurrency || 3))),
+    }
 
     const newProxy = {
       enabled: draft.proxyEnabled,
@@ -442,6 +458,7 @@ export function SettingsView() {
     setLlmConfig(newLlm)
     setEmbeddingConfig(newEmbed)
     setMultimodalConfig(newMultimodal)
+    setIngestConfig(newIngest)
     setOutputLanguage(draft.outputLanguage as typeof outputLanguage)
     setProxyConfig(newProxy)
     setSourceWatchConfig(newSourceWatch)
@@ -455,6 +472,7 @@ export function SettingsView() {
       await saveLlmConfig(newLlm)
       await saveEmbeddingConfig(newEmbed)
       await saveMultimodalConfig(newMultimodal)
+      await saveIngestConfig(newIngest)
       await saveOutputLanguage(draft.outputLanguage as typeof outputLanguage, project?.id)
       await saveProxyConfig(newProxy)
       await saveSourceWatchConfig(newSourceWatch, project?.id)
@@ -550,6 +568,7 @@ export function SettingsView() {
           persistedLlm,
           persistedEmbedding,
           persistedMultimodal,
+          persistedIngest,
           persistedOutputLanguage,
           persistedProxy,
           persistedSourceWatch,
@@ -562,6 +581,7 @@ export function SettingsView() {
           loadLlmConfig(),
           loadEmbeddingConfig(),
           loadMultimodalConfig(),
+          loadIngestConfig(),
           loadOutputLanguage(project?.id),
           loadProxyConfig(),
           loadSourceWatchConfig(project?.id),
@@ -574,6 +594,7 @@ export function SettingsView() {
         setLlmConfig(resultValue(persistedLlm, null) ?? llmConfig)
         setEmbeddingConfig(resultValue(persistedEmbedding, null) ?? embeddingConfig)
         setMultimodalConfig(resultValue(persistedMultimodal, null) ?? multimodalConfig)
+        setIngestConfig(resultValue(persistedIngest, null) ?? ingestConfig)
         setOutputLanguage((resultValue(persistedOutputLanguage, null) ?? outputLanguage) as typeof outputLanguage)
         setProxyConfig(resultValue(persistedProxy, null) ?? proxyConfig)
         setSourceWatchConfig(resultValue(persistedSourceWatch, sourceWatchConfig))
@@ -594,6 +615,7 @@ export function SettingsView() {
     llmConfig,
     embeddingConfig,
     multimodalConfig,
+    ingestConfig,
     outputLanguage,
     proxyConfig,
     sourceWatchConfig,
@@ -605,6 +627,7 @@ export function SettingsView() {
     setLlmConfig,
     setEmbeddingConfig,
     setMultimodalConfig,
+    setIngestConfig,
     setOutputLanguage,
     setProxyConfig,
     setScheduledImportConfig,

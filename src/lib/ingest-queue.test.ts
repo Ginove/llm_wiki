@@ -253,7 +253,7 @@ describe("ingest-queue — retry & failure", () => {
     expect(mockAutoIngest).toHaveBeenCalledOnce()
     expect(getQueue().map((task) => task.error)).toEqual([null, null])
     expect(getQueue().map((task) => task.retryCount)).toEqual([0, 0])
-    expect(getQueue().map((task) => task.status)).toEqual(["processing", "pending"])
+    expect(getQueue().map((task) => task.status)).toEqual(["processing", "processing"])
     expect(mockWriteFile).toHaveBeenCalled()
   })
 
@@ -807,7 +807,10 @@ describe("ingest-queue — pause/resume processing", () => {
 
     resumeProcessing()
     await flushMicrotasks(5)
-    expect(mockAutoIngest).toHaveBeenCalledTimes(1)
+    // With parallel ingest, resumeProcessing starts a new autoIngest call
+    // for the pending task. The initial call (#1) is still in-flight
+    // (its promise hasn't settled due to the empty abort handler).
+    expect(mockAutoIngest).toHaveBeenCalledTimes(2)
 
     rejectFirst(new Error("aborted"))
     await flushMicrotasks(10)

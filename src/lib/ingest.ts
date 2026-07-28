@@ -27,7 +27,8 @@ import { parseSources, writeSources } from "@/lib/sources-merge"
 import { checkIngestCache, saveIngestCache } from "@/lib/ingest-cache"
 import { sanitizeIngestedFileContent } from "@/lib/ingest-sanitize"
 import { mergePageContent, type MergeFn } from "@/lib/page-merge"
-import { withProjectLock } from "@/lib/project-mutex"
+import { withPageWriteLock } from "@/lib/page-write-lock"
+import { withCommitLock } from "@/lib/commit-lock"
 import { parseFrontmatter } from "@/lib/frontmatter"
 import { makeQuerySlug } from "@/lib/wiki-filename"
 import type { FileNode } from "@/types/wiki"
@@ -577,9 +578,12 @@ export async function autoIngest(
   folderContext?: string,
   onFileWritten?: (relativePath: string) => void,
 ): Promise<string[]> {
-  return withProjectLock(normalizePath(projectPath), () =>
-    autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext, onFileWritten),
-  )
+  // No project-level mutex here. The pipeline uses fine-grained locks:
+  //   - LLM compute phases (MinerU, captions, analysis, generation) run lock-free.
+  //   - Individual page writes use withPageWriteLock (per-page serialization).
+  //   - Aggregate commits (index.md, log.md, cache) use withCommitLock.
+  // This allows multiple ingests to overlap their expensive LLM phases.
+  return autoIngestImpl(projectPath, sourcePath, llmConfig, signal, folderContext, onFileWritten)
 }
 
 function throwIfIngestAborted(signal: AbortSignal | undefined, activityId?: string): void {
@@ -1231,34 +1235,37 @@ async function autoIngestImpl(
     }
   }
 
-  try {
-    if (await updateWikiIndexDeterministically(pp, writtenPaths)) {
-      writtenPaths.push("wiki/index.md")
-      onFileWritten?.("wiki/index.md")
-    }
-  } catch (err) {
-    writeWarnings.push(
-      `Deterministic index update failed: ${err instanceof Error ? err.message : String(err)}`,
-    )
-  }
-
-  // log.md is append-only structural metadata. If the model omitted its FILE
-  // block, write a deterministic entry instead of starting another LLM turn.
-  // This keeps multi-file imports at two generation stages per source and
-  // prevents a slow provider from making the queue appear stuck in "repair".
-  if (!writtenPaths.some((path) => normalizePath(path).toLowerCase() === "wiki/log.md") && !signal?.aborted) {
+  // ── Commit phase: index.md + log.md + cache (serialized via commit lock) ──
+  await withCommitLock(pp, async () => {
     try {
-      const logPath = `${pp}/wiki/log.md`
-      const existingLog = await tryReadFile(logPath)
-      await writeFile(logPath, buildDeterministicIngestLog(existingLog, sourceIdentity))
-      writtenPaths.push("wiki/log.md")
-      onFileWritten?.("wiki/log.md")
+      if (await updateWikiIndexDeterministically(pp, writtenPaths)) {
+        writtenPaths.push("wiki/index.md")
+        onFileWritten?.("wiki/index.md")
+      }
     } catch (err) {
       writeWarnings.push(
-        `Deterministic log update failed: ${err instanceof Error ? err.message : String(err)}`,
+        `Deterministic index update failed: ${err instanceof Error ? err.message : String(err)}`,
       )
     }
-  }
+
+    // log.md is append-only structural metadata. If the model omitted its FILE
+    // block, write a deterministic entry instead of starting another LLM turn.
+    // This keeps multi-file imports at two generation stages per source and
+    // prevents a slow provider from making the queue appear stuck in "repair".
+    if (!writtenPaths.some((path) => normalizePath(path).toLowerCase() === "wiki/log.md") && !signal?.aborted) {
+      try {
+        const logPath = `${pp}/wiki/log.md`
+        const existingLog = await tryReadFile(logPath)
+        await writeFile(logPath, buildDeterministicIngestLog(existingLog, sourceIdentity))
+        writtenPaths.push("wiki/log.md")
+        onFileWritten?.("wiki/log.md")
+      } catch (err) {
+        writeWarnings.push(
+          `Deterministic log update failed: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
+    }
+  })
 
   // Surface parser / writer warnings to the activity panel so users
   // don't have to open devtools to find out a block was dropped.
@@ -1325,15 +1332,18 @@ async function autoIngestImpl(
   // ── Step 5: Save to cache ───────────────────────────────────
   // Skip cache when a write fails or a truncated path remains unrecovered;
   // otherwise the partial result would be replayed without another LLM turn.
+  // Uses commit lock to prevent concurrent cache file corruption.
   if (
     writtenPaths.length > 0 &&
     hardFailures.length === 0 &&
     unrecoveredTruncatedPaths.length === 0
   ) {
-    await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)
-    if (longSourceCheckpointPath) {
-      await clearLongSourceCheckpoint(longSourceCheckpointPath)
-    }
+    await withCommitLock(pp, async () => {
+      await saveIngestCache(pp, sourceIdentity, sourceContent, writtenPaths)
+      if (longSourceCheckpointPath) {
+        await clearLongSourceCheckpoint(longSourceCheckpointPath)
+      }
+    })
   } else if (hardFailures.length > 0 || unrecoveredTruncatedPaths.length > 0) {
     console.warn(
       `[ingest] Skipping cache save for "${sourceIdentity}" — ${hardFailures.length} write failure(s), ${unrecoveredTruncatedPaths.length} truncated FILE block(s) still missing.`,
@@ -1341,13 +1351,16 @@ async function autoIngestImpl(
   }
 
   // ── Step 6: Generate embeddings (if enabled) ───────────────
+  // Parallelized: each page's embedPage call is independent, and the
+  // embedding backend already has its own AsyncLimiter for HTTP
+  // concurrency. We just need to fire the requests in parallel here.
   const embCfg = useWikiStore.getState().embeddingConfig
   if (embCfg.enabled && embCfg.model && writtenPaths.length > 0) {
     try {
       const { embedPage } = await import("@/lib/embedding")
-      for (const wpath of writtenPaths) {
+      await Promise.all(writtenPaths.map(async (wpath) => {
         const pageId = wpath.split("/").pop()?.replace(/\.md$/, "") ?? ""
-        if (!pageId || ["index", "log", "overview"].includes(pageId)) continue
+        if (!pageId || ["index", "log", "overview"].includes(pageId)) return
         try {
           const content = await readFile(`${pp}/${wpath}`)
           const fmTitle = parseFrontmatter(content).frontmatter?.title
@@ -1356,7 +1369,7 @@ async function autoIngestImpl(
         } catch {
           // non-critical
         }
-      }
+      }))
     } catch {
       // embedding module not available
     }
@@ -1904,59 +1917,64 @@ async function writeFileBlocks(
 
     const fullPath = `${projectPath}/${relativePath}`
     try {
-      if (isLogPath(relativePath)) {
-        const existing = await tryReadFile(fullPath)
-        const appended = existing ? `${existing}\n\n${content.trim()}` : content.trim()
-        await writeFile(fullPath, appended)
-      } else if (
-        isListingPath(relativePath)
-      ) {
-        // Listing pages (index / overview) are always overwritten
-        // wholesale — their sources field is incidental and merging
-        // wouldn't make semantic sense (they aren't source-derived
-        // content pages).
-        await writeFile(fullPath, content)
-      } else {
-        // Content pages (entities / concepts / queries / synthesis /
-        // comparisons / sources summaries): if a page with this
-        // path already exists on disk, merge old + new instead of
-        // clobbering. The merge has three layers:
-        //   1. Frontmatter array fields (sources, tags, related)
-        //      are union-merged at the application layer.
-        //   2. If body content differs, an LLM call produces a
-        //      coherent merged body — preserves contributions from
-        //      every source document.
-        //   3. Locked frontmatter fields (type, title, created)
-        //      are forced back to the existing values; updated is
-        //      stamped today.
-        // LLM failure / sanity rejection falls back to "incoming
-        // body + array-field union" with a best-effort backup.
-        // See page-merge.ts.
-        const existing = await tryReadFile(fullPath)
-        // Re-ingesting a corrected source must replace pages owned solely by
-        // that source. Merging the old body back into the new generation kept
-        // retracted wording alive indefinitely. Multi-source pages still use
-        // the merger because their other sources' contributions must survive.
-        const replaceExistingBody = Boolean(
-          existing && isOwnedOnlyBySource(existing, sourceFileName),
-        )
-        const merged = await mergePageContent(
-          content,
-          existing || null,
-          buildPageMerger(llmConfig),
-          {
-            sourceFileName,
-            pagePath: relativePath,
-            signal,
-            backup: (oldContent) => backupExistingPage(projectPath, relativePath, oldContent),
-            replaceExistingBody,
-          },
-        )
-        // The merge unions existing frontmatter arrays, so sanitize again to
-        // remove legacy/generated paths that may already be stored on disk.
-        const toWrite = canonicalizeSourcesField(merged, sourceFileName)
-        await writeFile(fullPath, toWrite)
-      }
+      // Wrap all read-modify-write operations in a per-page lock so
+      // concurrent ingests writing to DIFFERENT pages run in parallel
+      // while writes to the SAME page serialize correctly.
+      await withPageWriteLock(projectPath, relativePath, async () => {
+        if (isLogPath(relativePath)) {
+          const existing = await tryReadFile(fullPath)
+          const appended = existing ? `${existing}\n\n${content.trim()}` : content.trim()
+          await writeFile(fullPath, appended)
+        } else if (
+          isListingPath(relativePath)
+        ) {
+          // Listing pages (index / overview) are always overwritten
+          // wholesale — their sources field is incidental and merging
+          // wouldn't make semantic sense (they aren't source-derived
+          // content pages).
+          await writeFile(fullPath, content)
+        } else {
+          // Content pages (entities / concepts / queries / synthesis /
+          // comparisons / sources summaries): if a page with this
+          // path already exists on disk, merge old + new instead of
+          // clobbering. The merge has three layers:
+          //   1. Frontmatter array fields (sources, tags, related)
+          //      are union-merged at the application layer.
+          //   2. If body content differs, an LLM call produces a
+          //      coherent merged body — preserves contributions from
+          //      every source document.
+          //   3. Locked frontmatter fields (type, title, created)
+          //      are forced back to the existing values; updated is
+          //      stamped today.
+          // LLM failure / sanity rejection falls back to "incoming
+          // body + array-field union" with a best-effort backup.
+          // See page-merge.ts.
+          const existing = await tryReadFile(fullPath)
+          // Re-ingesting a corrected source must replace pages owned solely by
+          // that source. Merging the old body back into the new generation kept
+          // retracted wording alive indefinitely. Multi-source pages still use
+          // the merger because their other sources' contributions must survive.
+          const replaceExistingBody = Boolean(
+            existing && isOwnedOnlyBySource(existing, sourceFileName),
+          )
+          const merged = await mergePageContent(
+            content,
+            existing || null,
+            buildPageMerger(llmConfig),
+            {
+              sourceFileName,
+              pagePath: relativePath,
+              signal,
+              backup: (oldContent) => backupExistingPage(projectPath, relativePath, oldContent),
+              replaceExistingBody,
+            },
+          )
+          // The merge unions existing frontmatter arrays, so sanitize again to
+          // remove legacy/generated paths that may already be stored on disk.
+          const toWrite = canonicalizeSourcesField(merged, sourceFileName)
+          await writeFile(fullPath, toWrite)
+        }
+      })
       writtenPaths.push(relativePath)
       completedInputPaths.push(rawRelativePath)
       onFileWritten?.(relativePath)
@@ -3221,9 +3239,8 @@ export function executeIngestWrites(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const pp = normalizePath(projectPath)
-  return withProjectLock(pp, () =>
-    executeIngestWritesImpl(pp, llmConfig, userGuidance, signal)
-  )
+  // Same fine-grained lock strategy as autoIngest — no global mutex.
+  return executeIngestWritesImpl(pp, llmConfig, userGuidance, signal)
 }
 
 async function executeIngestWritesImpl(
@@ -3358,15 +3375,17 @@ async function executeIngestWritesImpl(
     const fullPath = `${pp}/${relativePath}`
 
     try {
-      if (isLogPath(relativePath)) {
-        const existing = await tryReadFile(fullPath)
-        const appended = existing
-          ? `${existing}\n\n${content.trim()}`
-          : content.trim()
-        await writeFile(fullPath, appended)
-      } else {
-        await writeFile(fullPath, content)
-      }
+      await withPageWriteLock(pp, relativePath, async () => {
+        if (isLogPath(relativePath)) {
+          const existing = await tryReadFile(fullPath)
+          const appended = existing
+            ? `${existing}\n\n${content.trim()}`
+            : content.trim()
+          await writeFile(fullPath, appended)
+        } else {
+          await writeFile(fullPath, content)
+        }
+      })
       writtenPaths.push(fullPath)
     } catch (err) {
       console.error(`Failed to write ${fullPath}:`, err)

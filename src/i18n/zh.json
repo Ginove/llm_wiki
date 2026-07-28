@@ -640,7 +640,9 @@
         "costPoint1": "每张新图触发一次视觉模型调用（约 500-2000 token，取决于模型和 thinking 模式）。",
         "costPoint2": "Caption 按图片字节 SHA-256 缓存。跨文档重复的 logo / 通用图表模板只调用 ONE 次。",
         "costPoint3": "Rust 端过滤掉小于 100×100 像素的图，并限制每文档最多 500 张 —— 病态 PDF 不会无限放大费用。",
-        "costPoint4": "批量 ingest 推荐用本地视觉模型（LM Studio / Ollama 跑 Qwen2.5-VL）；托管视觉 API 留给少量高价值文档。"
+        "costPoint4": "批量 ingest 推荐用本地视觉模型（LM Studio / Ollama 跑 Qwen2.5-VL）；托管视觉 API 留给少量高价值文档。",
+        "ingestConcurrency": "并发 Ingest 任务数",
+        "ingestConcurrencyHint": "同时处理多少个文档。每个 ingest 会发起多次 LLM 调用，3 并发可能意味着 9+ 个并行 API 请求。1 = 串行（旧行为）。推荐 3。"
       },
       "webSearch": {
         "title": "外部信息源",
